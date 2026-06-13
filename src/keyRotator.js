@@ -4,6 +4,7 @@ class KeyRotator {
     this.apiType = apiType;
     this.lastFailedKey = null; // Track the key that failed in the last request
     this.keyUsageCount = new Map(); // Track per-key usage count
+    this.currentKeyIndex = 0; // Persistent active key index for sequential rotation
     // Initialize usage counts for all keys
     for (const key of this.apiKeys) {
       this.keyUsageCount.set(key, 0);
@@ -12,11 +13,11 @@ class KeyRotator {
   }
 
   /**
-   * Creates a new request context for per-request key rotation with smart shuffling
+   * Creates a new request context for per-request key rotation
    * @returns {RequestKeyContext} A new context for managing keys for a single request
    */
   createRequestContext() {
-    return new RequestKeyContext(this.apiKeys, this.apiType, this.lastFailedKey);
+    return new RequestKeyContext(this.apiKeys, this.apiType, this.currentKeyIndex);
   }
 
   /**
@@ -37,6 +38,11 @@ class KeyRotator {
   incrementKeyUsage(key) {
     if (this.keyUsageCount.has(key)) {
       this.keyUsageCount.set(key, this.keyUsageCount.get(key) + 1);
+    }
+    // Update the active key index to the key that just succeeded
+    const keyIndex = this.apiKeys.indexOf(key);
+    if (keyIndex !== -1) {
+      this.currentKeyIndex = keyIndex;
     }
   }
 
@@ -67,10 +73,10 @@ class KeyRotator {
 
 /**
  * Manages API key rotation for a single request
- * Each request gets its own context to try all available keys with smart shuffling
+ * Each request gets its own context to try all available keys in sequential round-robin order
  */
 class RequestKeyContext {
-  constructor(apiKeys, apiType, lastFailedKey = null) {
+  constructor(apiKeys, apiType, activeKeyIndex = 0) {
     this.originalApiKeys = [...apiKeys];
     this.apiType = apiType;
     this.currentIndex = 0;
@@ -78,42 +84,29 @@ class RequestKeyContext {
     this.rateLimitedKeys = new Set();
     this.lastFailedKeyForThisRequest = null;
     
-    // Apply smart shuffling: shuffle keys but move last failed key to end
-    this.apiKeys = this.smartShuffle(apiKeys, lastFailedKey);
+    // Order keys sequentially starting from the activeKeyIndex
+    this.apiKeys = this.getSequentialKeys(apiKeys, activeKeyIndex);
     
-    if (lastFailedKey) {
-      const maskedKey = this.maskApiKey(lastFailedKey);
-      console.log(`[${this.apiType.toUpperCase()}] Smart shuffle applied - last failed key ${maskedKey} moved to end`);
+    if (this.apiKeys.length > 0 && activeKeyIndex < apiKeys.length) {
+      const maskedKey = this.maskApiKey(apiKeys[activeKeyIndex]);
+      console.log(`[${this.apiType.toUpperCase()}] Starting request with active key ${maskedKey}`);
     }
   }
   
   /**
-   * Smart shuffle: randomize key order but move last failed key to the end
+   * Order keys sequentially starting from the activeKeyIndex
    * @param {Array} keys Array of API keys
-   * @param {string|null} lastFailedKey The key that failed in the previous request
-   * @returns {Array} Shuffled array with last failed key at the end
+   * @param {number} activeKeyIndex The index of the active key to start from
+   * @returns {Array} Reordered array of keys
    */
-  smartShuffle(keys, lastFailedKey) {
-    const shuffled = [...keys];
-    
-    // Fisher-Yates shuffle algorithm
-    for (let i = shuffled.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  getSequentialKeys(keys, activeKeyIndex) {
+    if (keys.length === 0) return [];
+    const index = activeKeyIndex % keys.length;
+    const reordered = [];
+    for (let i = 0; i < keys.length; i++) {
+      reordered.push(keys[(index + i) % keys.length]);
     }
-    
-    // If we have a last failed key, move it to the end
-    if (lastFailedKey && keys.includes(lastFailedKey)) {
-      const failedKeyIndex = shuffled.indexOf(lastFailedKey);
-      if (failedKeyIndex !== -1) {
-        // Remove the failed key from its current position
-        shuffled.splice(failedKeyIndex, 1);
-        // Add it to the end
-        shuffled.push(lastFailedKey);
-      }
-    }
-    
-    return shuffled;
+    return reordered;
   }
 
   /**
