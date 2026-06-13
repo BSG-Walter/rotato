@@ -55,11 +55,12 @@ class GeminiClient {
         if (streaming) {
           const response = await this.sendStreamingRequest(method, path, body, headers, apiKey, false);
 
-          if (rotationStatusCodes.has(response.statusCode)) {
-            console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key`);
+          const rotationReason = this.getRotationReason(response, rotationStatusCodes);
+          if (rotationReason) {
+            console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
             response.stream.resume();
             requestContext.markKeyAsRateLimited(apiKey);
-            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: 'rate_limited' });
+            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
             lastResponse = { statusCode: response.statusCode, headers: response.headers, data: '' };
             continue;
           }
@@ -71,10 +72,11 @@ class GeminiClient {
         } else {
           const response = await this.sendRequest(method, path, body, headers, apiKey, false);
 
-          if (rotationStatusCodes.has(response.statusCode)) {
-            console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key`);
+          const rotationReason = this.getRotationReason(response, rotationStatusCodes);
+          if (rotationReason) {
+            console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
             requestContext.markKeyAsRateLimited(apiKey);
-            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: 'rate_limited' });
+            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
             lastResponse = response;
             continue;
           }
@@ -148,13 +150,20 @@ class GeminiClient {
     }
 
     const url = new URL(fullUrl);
+    this.normalizeOpenAICompatibleUrl(url);
 
     const finalHeaders = {
       'Content-Type': 'application/json',
       ...headers
     };
 
-    if (useHeader) {
+    const usesOpenAICompatibility = this.isOpenAICompatibleEndpoint(url.pathname);
+
+    if (usesOpenAICompatibility) {
+      if (!headers || !headers.authorization) {
+        finalHeaders['Authorization'] = `Bearer ${apiKey}`;
+      }
+    } else if (useHeader) {
       finalHeaders['x-goog-api-key'] = apiKey;
     } else {
       url.searchParams.append('key', apiKey);
@@ -236,6 +245,66 @@ class GeminiClient {
 
       req.end();
     });
+  }
+
+  getRotationReason(response, rotationStatusCodes) {
+    if (rotationStatusCodes.has(response.statusCode)) {
+      return {
+        reason: response.statusCode === 429 ? 'rate_limited' : `status_${response.statusCode}`,
+        logMessage: `Status ${response.statusCode} triggers rotation`
+      };
+    }
+
+    const authError = this.getGeminiAuthError(response);
+    if (authError) {
+      return {
+        reason: 'invalid_api_key',
+        logMessage: `Gemini auth error (${authError}) triggers rotation`
+      };
+    }
+
+    return null;
+  }
+
+  getGeminiAuthError(response) {
+    if (!response || response.statusCode !== 400 || !response.data) {
+      return null;
+    }
+
+    let data;
+    try {
+      data = JSON.parse(response.data);
+    } catch {
+      return null;
+    }
+
+    const errors = Array.isArray(data) ? data.map(item => item && item.error) : [data.error];
+    for (const error of errors) {
+      const status = String(error?.status || '').toUpperCase();
+      const message = String(error?.message || '').toLowerCase();
+
+      if (message.includes('valid api key')
+        || message.includes('api key not valid')
+        || message.includes('invalid api key')
+        || message.includes('permission denied for api key')
+        || (status === 'INVALID_ARGUMENT' && message.includes('api key'))) {
+        return error.message || status;
+      }
+    }
+
+    return null;
+  }
+
+  isOpenAICompatibleEndpoint(pathname) {
+    return /\/openai\//.test(pathname) || /\/chat\/completions$/.test(pathname);
+  }
+
+  normalizeOpenAICompatibleUrl(url) {
+    if (/\/openai\//.test(url.pathname) || !/\/chat\/completions$/.test(url.pathname)) {
+      return;
+    }
+
+    url.pathname = url.pathname.replace(/\/chat\/completions$/, '/openai/chat/completions');
   }
 
   maskApiKey(key) {

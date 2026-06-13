@@ -15,6 +15,7 @@ class ProxyServer {
     this.adminSessionToken = null;
     this.logBuffer = []; // Store logs in RAM only (last 100 entries)
     this.responseStorage = new Map(); // Store response data for viewing
+    this.geminiThoughtSignatures = new Map(); // Preserve Gemini 3.x tool-call signatures across OpenAI clients
 
     // File logging - debounced write
     this.pendingLogEntries = [];
@@ -179,10 +180,14 @@ class ProxyServer {
 
       console.log(`[REQ-${requestId}] Proxying to provider '${providerName}' (${apiType.toUpperCase()}): ${path}`);
 
-      // Get the appropriate header based on API type
+      // Get the appropriate header based on API type. Gemini native clients use
+      // x-goog-api-key, while OpenAI-compatible Gemini clients commonly send
+      // Authorization for proxy metadata such as [ACCESS_KEY:...].
+      const apiKeyHeader = req.headers['x-goog-api-key'];
+      const authorizationHeader = req.headers['authorization'];
       const authHeader = apiType === 'gemini'
-        ? req.headers['x-goog-api-key']
-        : req.headers['authorization'];
+        ? (apiKeyHeader || authorizationHeader)
+        : authorizationHeader;
 
       // Parse custom status codes and access key from header
       const customStatusCodes = this.parseStatusCodesFromAuth(authHeader);
@@ -206,7 +211,9 @@ class ProxyServer {
         const cleanedAuth = this.cleanAuthHeader(authHeader);
         if (cleanedAuth) {
           if (apiType === 'gemini') {
-            headers['x-goog-api-key'] = cleanedAuth;
+            if (apiKeyHeader) {
+              headers['x-goog-api-key'] = cleanedAuth;
+            }
           } else {
             headers['authorization'] = cleanedAuth;
           }
@@ -241,7 +248,8 @@ class ProxyServer {
         console.log(`[REQ-${requestId}] Streaming request detected`);
       }
 
-      response = await client.makeRequest(req.method, path, body, headers, customStatusCodes, isStreaming);
+      const requestBody = this.applyGeminiThoughtSignatures(providerName, apiType, path, body);
+      response = await client.makeRequest(req.method, path, requestBody, headers, customStatusCodes, isStreaming);
 
       // Extract key info from response
       const keyInfo = response._keyInfo || null;
@@ -277,6 +285,10 @@ class ProxyServer {
           if (truncated) {
             streamedData += `\n\n[... truncated at 512KB — total streamed: ${(capturedSize / 1024).toFixed(1)}KB]`;
           }
+          this.captureGeminiThoughtSignatures(providerName, apiType, path, {
+            statusCode: response.statusCode,
+            data: streamedData
+          });
           this.storeResponseData(requestId, {
             method: req.method,
             endpoint: path,
@@ -312,7 +324,8 @@ class ProxyServer {
           this.logApiRequest(requestId, req.method, path, providerName, response.statusCode, responseTime, error, clientIp, keyInfo);
         }
 
-        this.logApiResponse(requestId, response, body);
+        this.captureGeminiThoughtSignatures(providerName, apiType, path, response);
+        this.logApiResponse(requestId, response, requestBody);
         this.sendResponse(res, response);
       }
     } catch (error) {
@@ -340,6 +353,170 @@ class ProxyServer {
         resolve(body || null);
       });
     });
+  }
+
+  isGeminiOpenAICompatibleChat(apiType, path) {
+    return apiType === 'gemini' && /\/chat\/completions(?:\?|$)/.test(path || '');
+  }
+
+  applyGeminiThoughtSignatures(providerName, apiType, path, body) {
+    if (!this.isGeminiOpenAICompatibleChat(apiType, path) || !body) {
+      return body;
+    }
+
+    let parsed;
+    try {
+      parsed = typeof body === 'string' ? JSON.parse(body) : body;
+    } catch {
+      return body;
+    }
+
+    if (!parsed || !Array.isArray(parsed.messages)) {
+      return body;
+    }
+
+    let injected = 0;
+    for (const message of parsed.messages) {
+      if (!message || !Array.isArray(message.tool_calls)) continue;
+
+      for (const toolCall of message.tool_calls) {
+        if (!toolCall || this.getThoughtSignature(toolCall)) continue;
+
+        const signature = this.findThoughtSignature(providerName, toolCall);
+        if (!signature) continue;
+
+        toolCall.extra_content = toolCall.extra_content || {};
+        toolCall.extra_content.google = toolCall.extra_content.google || {};
+        toolCall.extra_content.google.thought_signature = signature;
+        injected++;
+      }
+    }
+
+    if (injected > 0) {
+      console.log(`[GEMINI] Injected ${injected} cached thought_signature value(s) into tool calls`);
+      return JSON.stringify(parsed);
+    }
+
+    return body;
+  }
+
+  captureGeminiThoughtSignatures(providerName, apiType, path, response) {
+    if (!this.isGeminiOpenAICompatibleChat(apiType, path) || !response || response.statusCode >= 400 || !response.data) {
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    } catch {
+      parsed = this.parseSseDataObjects(response.data);
+      if (!parsed) return;
+    }
+
+    const responses = Array.isArray(parsed) ? parsed : [parsed];
+    const toolCalls = [];
+    for (const item of responses) {
+      for (const choice of item.choices || []) {
+        const calls = choice?.message?.tool_calls || choice?.delta?.tool_calls || [];
+        if (Array.isArray(calls)) {
+          toolCalls.push(...calls);
+        }
+      }
+    }
+
+    let captured = 0;
+    for (const toolCall of toolCalls) {
+      const signature = this.getThoughtSignature(toolCall);
+      if (!signature) continue;
+
+      for (const cacheKey of this.getThoughtSignatureCacheKeys(providerName, toolCall)) {
+        this.geminiThoughtSignatures.set(cacheKey, {
+          signature,
+          createdAt: Date.now()
+        });
+        captured++;
+      }
+    }
+
+    if (captured > 0) {
+      this.pruneThoughtSignatureCache();
+      console.log(`[GEMINI] Cached ${captured} thought_signature lookup key(s) from tool calls`);
+    }
+  }
+
+  parseSseDataObjects(data) {
+    if (typeof data !== 'string') return null;
+
+    const objects = [];
+    for (const line of data.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+
+      try {
+        objects.push(JSON.parse(payload));
+      } catch {
+        // Ignore non-JSON SSE payloads.
+      }
+    }
+
+    return objects.length > 0 ? objects : null;
+  }
+
+  getThoughtSignature(toolCall) {
+    return toolCall?.extra_content?.google?.thought_signature
+      || toolCall?.extra_content?.google?.thoughtSignature
+      || toolCall?.thought_signature
+      || toolCall?.thoughtSignature
+      || null;
+  }
+
+  findThoughtSignature(providerName, toolCall) {
+    for (const cacheKey of this.getThoughtSignatureCacheKeys(providerName, toolCall)) {
+      const cached = this.geminiThoughtSignatures.get(cacheKey);
+      if (cached) {
+        cached.createdAt = Date.now();
+        return cached.signature;
+      }
+    }
+    return null;
+  }
+
+  getThoughtSignatureCacheKeys(providerName, toolCall) {
+    const keys = [];
+    if (toolCall?.id) {
+      keys.push(`${providerName}:id:${toolCall.id}`);
+    }
+
+    const functionName = toolCall?.function?.name;
+    const args = toolCall?.function?.arguments;
+    if (functionName) {
+      const argsHash = crypto
+        .createHash('sha256')
+        .update(typeof args === 'string' ? args : JSON.stringify(args || {}))
+        .digest('hex');
+      keys.push(`${providerName}:fn:${functionName}:${argsHash}`);
+    }
+
+    return keys;
+  }
+
+  pruneThoughtSignatureCache() {
+    const maxEntries = 1000;
+    const maxAgeMs = 30 * 60 * 1000;
+    const now = Date.now();
+
+    for (const [key, value] of this.geminiThoughtSignatures.entries()) {
+      if (now - value.createdAt > maxAgeMs) {
+        this.geminiThoughtSignatures.delete(key);
+      }
+    }
+
+    while (this.geminiThoughtSignatures.size > maxEntries) {
+      const firstKey = this.geminiThoughtSignatures.keys().next().value;
+      this.geminiThoughtSignatures.delete(firstKey);
+    }
   }
 
   parseRoute(url) {
