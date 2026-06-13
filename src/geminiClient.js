@@ -55,14 +55,30 @@ class GeminiClient {
         if (streaming) {
           const response = await this.sendStreamingRequest(method, path, body, headers, apiKey, false);
 
+          // If the streaming request returned an error status code, drain the stream to get the error payload
+          if (response.statusCode >= 400) {
+            response.data = await this.drainStreamingResponse(response.stream);
+          }
+
           const rotationReason = this.getRotationReason(response, rotationStatusCodes);
           if (rotationReason) {
             console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
-            response.stream.resume();
-            requestContext.markKeyAsRateLimited(apiKey);
+            const isRateLimited = rotationReason.reason === 'rate_limited';
+            if (isRateLimited) {
+              requestContext.markKeyAsRateLimited(apiKey);
+            } else {
+              requestContext.markKeyAsFailed(apiKey);
+            }
             failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
-            lastResponse = { statusCode: response.statusCode, headers: response.headers, data: '' };
+            lastResponse = { statusCode: response.statusCode, headers: response.headers, data: response.data };
             continue;
+          }
+
+          // If we have an error status code but it did NOT trigger rotation, return the error response directly
+          if (response.statusCode >= 400) {
+            console.log(`[GEMINI::${maskedKey}] Request failed with status ${response.statusCode} - not rotating`);
+            response._keyInfo = { keyUsed: maskedKey, failedKeys };
+            return response;
           }
 
           console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode}) - streaming`);
@@ -75,7 +91,11 @@ class GeminiClient {
           const rotationReason = this.getRotationReason(response, rotationStatusCodes);
           if (rotationReason) {
             console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
-            requestContext.markKeyAsRateLimited(apiKey);
+            if (rotationReason.reason === 'rate_limited') {
+              requestContext.markKeyAsRateLimited(apiKey);
+            } else {
+              requestContext.markKeyAsFailed(apiKey);
+            }
             failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
             lastResponse = response;
             continue;
@@ -95,7 +115,7 @@ class GeminiClient {
     }
 
     const stats = requestContext.getStats();
-    console.log(`[GEMINI] All ${stats.totalKeys} keys tried for this request. ${stats.rateLimitedKeys} were rate limited.`);
+    console.log(`[GEMINI] All ${stats.totalKeys} keys tried for this request. ${stats.rateLimitedKeys} were rate limited, ${stats.failedKeys} failed.`);
 
     const lastFailedKey = requestContext.getLastFailedKey();
     this.keyRotator.updateLastFailedKey(lastFailedKey);
@@ -110,6 +130,23 @@ class GeminiClient {
             code: 429,
             message: 'All API keys have been rate limited for this request',
             status: 'RESOURCE_EXHAUSTED'
+          }
+        })
+      };
+      response._keyInfo = { keyUsed: null, failedKeys };
+      return response;
+    }
+
+    if (requestContext.allTriedKeysFailed()) {
+      console.log('[GEMINI] All keys failed for this request - returning last error response');
+      const response = lastResponse || {
+        statusCode: 500,
+        headers: { 'content-type': 'application/json' },
+        data: JSON.stringify({
+          error: {
+            code: 500,
+            message: 'All API keys failed for this request',
+            status: 'INTERNAL'
           }
         })
       };
@@ -247,6 +284,23 @@ class GeminiClient {
     });
   }
 
+  drainStreamingResponse(stream) {
+    return new Promise((resolve) => {
+      let data = '';
+
+      stream.setEncoding('utf8');
+      stream.on('data', (chunk) => {
+        data += chunk;
+      });
+      stream.on('end', () => {
+        resolve(data);
+      });
+      stream.on('error', () => {
+        resolve(data);
+      });
+    });
+  }
+
   getRotationReason(response, rotationStatusCodes) {
     if (rotationStatusCodes.has(response.statusCode)) {
       return {
@@ -267,7 +321,7 @@ class GeminiClient {
   }
 
   getGeminiAuthError(response) {
-    if (!response || response.statusCode !== 400 || !response.data) {
+    if (!response || (response.statusCode !== 400 && response.statusCode !== 403) || !response.data) {
       return null;
     }
 
@@ -287,7 +341,8 @@ class GeminiClient {
         || message.includes('api key not valid')
         || message.includes('invalid api key')
         || message.includes('permission denied for api key')
-        || (status === 'INVALID_ARGUMENT' && message.includes('api key'))) {
+        || (status === 'INVALID_ARGUMENT' && message.includes('api key'))
+        || status === 'PERMISSION_DENIED') {
         return error.message || status;
       }
     }

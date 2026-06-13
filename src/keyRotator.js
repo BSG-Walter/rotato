@@ -82,6 +82,7 @@ class RequestKeyContext {
     this.currentIndex = 0;
     this.triedKeys = new Set();
     this.rateLimitedKeys = new Set();
+    this.failedKeys = new Set();
     this.lastFailedKeyForThisRequest = null;
     
     // Order keys sequentially starting from the activeKeyIndex
@@ -139,11 +140,26 @@ class RequestKeyContext {
   }
 
   /**
+   * Marks the current key as failed for this request
+   * @param {string} key The API key that failed
+   */
+  markKeyAsFailed(key) {
+    this.failedKeys.add(key);
+    this.lastFailedKeyForThisRequest = key; // Track the most recent failed key
+    const maskedKey = this.maskApiKey(key);
+    console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Failed for this request (${this.failedKeys.size}/${this.triedKeys.size} failed)`);
+
+    // Move to next key for the next attempt
+    this.currentIndex = (this.currentIndex + 1) % this.apiKeys.length;
+  }
+
+  /**
    * Marks the current key as rate limited for this request
    * @param {string} key The API key that was rate limited
    */
   markKeyAsRateLimited(key) {
     this.rateLimitedKeys.add(key);
+    this.failedKeys.add(key);
     this.lastFailedKeyForThisRequest = key; // Track the most recent failed key
     const maskedKey = this.maskApiKey(key);
     console.log(`[${this.apiType.toUpperCase()}::${maskedKey}] Rate limited for this request (${this.rateLimitedKeys.size}/${this.triedKeys.size} rate limited)`);
@@ -158,6 +174,14 @@ class RequestKeyContext {
    */
   getLastFailedKey() {
     return this.lastFailedKeyForThisRequest;
+  }
+
+  /**
+   * Checks if all tried keys failed
+   * @returns {boolean} True if all keys that were tried failed
+   */
+  allTriedKeysFailed() {
+    return this.triedKeys.size > 0 && this.failedKeys.size === this.triedKeys.size;
   }
 
   /**
@@ -185,6 +209,7 @@ class RequestKeyContext {
       totalKeys: this.apiKeys.length,
       triedKeys: this.triedKeys.size,
       rateLimitedKeys: this.rateLimitedKeys.size,
+      failedKeys: this.failedKeys.size,
       hasUntriedKeys: this.triedKeys.size < this.apiKeys.length
     };
   }
