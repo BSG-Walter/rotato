@@ -41,6 +41,26 @@ ADMIN_PASSWORD=your-secure-password
 
 Visit http://localhost:8990/admin to configure your providers and start using the API.
 
+## Proxy Rotation (Webshare)
+
+If your API keys frequently trigger `429` (Too Many Requests) or `404` errors due to IP-based rate limiting, you can enable automatic Proxy Rotation using Webshare proxies. 
+
+When enabled, the server will rotate through your proxy list on rate limits before trying a new API key. It uses a 2-layer retry logic:
+1. **Rotate Proxy**: If a request fails with `429` or `404`, the server first switches to the next proxy IP and retries the request with the same API key.
+2. **Rotate API Key**: If the request fails a second time with a different proxy, the server assumes the key itself is exhausted, marks it as failed, rotates to the next API key, and resets the proxy loop.
+
+### Setup
+
+1. Sign up on [Webshare](https://www.webshare.io/) (the 10 free proxies are sufficient).
+2. Go to your Webshare Dashboard and find your **API Key** (Token).
+3. Add your key to your `.env` file:
+
+```env
+WEBSHARE_API_KEY=your-webshare-token-here
+```
+
+4. Restart the server or update it via the Admin Panel. The server will dynamically fetch and refresh your active proxy list in memory.
+
 ## Telegram Bot
 
 Chat with any of your configured models directly from Telegram. Set it up from the admin panel (Settings icon) or add these to your `.env`:

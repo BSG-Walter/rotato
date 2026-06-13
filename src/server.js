@@ -31,12 +31,16 @@ class ProxyServer {
     this.KeyRotator = require('./keyRotator');
     this.GeminiClient = require('./geminiClient');
     this.OpenAIClient = require('./openaiClient');
+    const ProxyRotator = require('./proxyRotator');
+    this.proxyRotator = new ProxyRotator(this.config.getWebshareApiKey());
 
     // Telegram bot (started after server.listen in start())
     this.telegramBot = new TelegramBot(this);
   }
 
-  start() {
+  async start() {
+    await this.proxyRotator.initialize();
+
     this.server = http.createServer((req, res) => {
       this.handleRequest(req, res);
     });
@@ -605,9 +609,9 @@ class ProxyServer {
       let client;
 
       if (provider.apiType === 'openai') {
-        client = new this.OpenAIClient(keyRotator, provider.baseUrl);
+        client = new this.OpenAIClient(keyRotator, provider.baseUrl, this.proxyRotator);
       } else if (provider.apiType === 'gemini') {
-        client = new this.GeminiClient(keyRotator, provider.baseUrl);
+        client = new this.GeminiClient(keyRotator, provider.baseUrl, this.proxyRotator);
       } else {
         return null;
       }
@@ -1078,6 +1082,8 @@ class ProxyServer {
 
       this.writeEnvFile(finalEnvVars);
       this.config.loadConfig();
+      this.proxyRotator.apiKey = this.config.getWebshareApiKey();
+      await this.proxyRotator.initialize();
       this.reinitializeClients();
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1644,7 +1650,7 @@ class ProxyServer {
     // Reinitialize legacy clients for backward compatibility
     if (this.config.hasGeminiKeys()) {
       const geminiKeyRotator = new this.KeyRotator(this.config.getGeminiApiKeys(), 'gemini');
-      this.geminiClient = new this.GeminiClient(geminiKeyRotator, this.config.getGeminiBaseUrl());
+      this.geminiClient = new this.GeminiClient(geminiKeyRotator, this.config.getGeminiBaseUrl(), this.proxyRotator);
       console.log('[SERVER] Legacy Gemini client reinitialized');
     } else {
       this.geminiClient = null;
@@ -1653,7 +1659,7 @@ class ProxyServer {
     
     if (this.config.hasOpenaiKeys()) {
       const openaiKeyRotator = new this.KeyRotator(this.config.getOpenaiApiKeys(), 'openai');
-      this.openaiClient = new this.OpenAIClient(openaiKeyRotator, this.config.getOpenaiBaseUrl());
+      this.openaiClient = new this.OpenAIClient(openaiKeyRotator, this.config.getOpenaiBaseUrl(), this.proxyRotator);
       console.log('[SERVER] Legacy OpenAI client reinitialized');
     } else {
       this.openaiClient = null;

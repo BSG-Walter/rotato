@@ -8,6 +8,7 @@ class Config {
     this.geminiApiKeys = [];
     this.openaiApiKeys = [];
     this.baseUrl = null;
+    this.webshareApiKey = null;
     this.loadConfig();
   }
 
@@ -49,10 +50,14 @@ class Config {
     // Set required fields
     this.port = parseInt(port);
     this.adminPassword = adminPassword;
+    this.webshareApiKey = envVars.WEBSHARE_API_KEY || process.env.WEBSHARE_API_KEY || null;
 
     const portSource = envVars.PORT ? '.env' : 'environment';
     console.log(`[CONFIG] Port: ${this.port} (from ${portSource})`);
     console.log(`[CONFIG] Admin panel enabled with password authentication`);
+    if (this.webshareApiKey) {
+      console.log(`[CONFIG] Webshare Proxy Key loaded`);
+    }
 
     // Clear existing providers
     this.providers.clear();
@@ -290,6 +295,10 @@ class Config {
 
   getAdminPassword() {
     return this.adminPassword;
+  }
+
+  getWebshareApiKey() {
+    return this.webshareApiKey;
   }
 
   hasAdminPassword() {

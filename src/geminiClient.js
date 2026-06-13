@@ -2,9 +2,10 @@ const https = require('https');
 const { URL } = require('url');
 
 class GeminiClient {
-  constructor(keyRotator, baseUrl = 'https://generativelanguage.googleapis.com') {
+  constructor(keyRotator, baseUrl = 'https://generativelanguage.googleapis.com', proxyRotator = null) {
     this.keyRotator = keyRotator;
     this.baseUrl = baseUrl;
+    this.proxyRotator = proxyRotator;
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null, streaming = false) {
@@ -43,74 +44,106 @@ class GeminiClient {
     let lastResponse = null;
     const failedKeys = [];
 
-    const rotationStatusCodes = customStatusCodes || new Set([429]);
+    const rotationStatusCodes = customStatusCodes || new Set([429, 404]);
 
     let apiKey;
     while ((apiKey = requestContext.getNextKey()) !== null) {
       const maskedKey = this.maskApiKey(apiKey);
 
-      console.log(`[GEMINI::${maskedKey}] Attempting ${method} ${path}${streaming ? ' (streaming)' : ''}`);
+      // Determine how many proxy attempts we will make for this key
+      const hasProxies = this.proxyRotator && this.proxyRotator.hasProxies();
+      const maxProxyAttempts = hasProxies ? 2 : 1;
 
-      try {
-        if (streaming) {
-          const response = await this.sendStreamingRequest(method, path, body, headers, apiKey, false);
+      for (let proxyAttempt = 0; proxyAttempt < maxProxyAttempts; proxyAttempt++) {
+        const proxy = hasProxies ? await this.proxyRotator.getNextProxy() : null;
+        const proxyLog = proxy ? ` via proxy ${proxy.proxy_address}:${proxy.port} (attempt ${proxyAttempt + 1}/2)` : '';
 
-          // If the streaming request returned an error status code, drain the stream to get the error payload
-          if (response.statusCode >= 400) {
-            response.data = await this.drainStreamingResponse(response.stream);
-          }
+        console.log(`[GEMINI::${maskedKey}] Attempting ${method} ${path}${streaming ? ' (streaming)' : ''}${proxyLog}`);
 
-          const rotationReason = this.getRotationReason(response, rotationStatusCodes);
-          if (rotationReason) {
-            console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
-            const isRateLimited = rotationReason.reason === 'rate_limited';
-            if (isRateLimited) {
-              requestContext.markKeyAsRateLimited(apiKey);
-            } else {
-              requestContext.markKeyAsFailed(apiKey);
+        try {
+          if (streaming) {
+            const response = await this.sendStreamingRequest(method, path, body, headers, apiKey, false, proxy);
+
+            // If the streaming request returned an error status code, drain the stream to get the error payload
+            if (response.statusCode >= 400) {
+              response.data = await this.drainStreamingResponse(response.stream);
             }
-            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
-            lastResponse = { statusCode: response.statusCode, headers: response.headers, data: response.data };
-            continue;
-          }
 
-          // If we have an error status code but it did NOT trigger rotation, return the error response directly
-          if (response.statusCode >= 400) {
-            console.log(`[GEMINI::${maskedKey}] Request failed with status ${response.statusCode} - not rotating`);
+            const rotationReason = this.getRotationReason(response, rotationStatusCodes);
+            if (rotationReason) {
+              const isAuthError = rotationReason.reason === 'invalid_api_key';
+
+              if (hasProxies && !isAuthError && proxyAttempt < maxProxyAttempts - 1) {
+                console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} - assuming proxy issue, rotating proxy...`);
+                lastResponse = { statusCode: response.statusCode, headers: response.headers, data: response.data };
+                continue;
+              }
+
+              console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
+              const isRateLimited = rotationReason.reason === 'rate_limited';
+              if (isRateLimited) {
+                requestContext.markKeyAsRateLimited(apiKey);
+              } else {
+                requestContext.markKeyAsFailed(apiKey);
+              }
+              failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
+              lastResponse = { statusCode: response.statusCode, headers: response.headers, data: response.data };
+              break; // Break the proxy loop to move to the next key
+            }
+
+            // If we have an error status code but it did NOT trigger rotation, return the error response directly
+            if (response.statusCode >= 400) {
+              console.log(`[GEMINI::${maskedKey}] Request failed with status ${response.statusCode} - not rotating`);
+              response._keyInfo = { keyUsed: maskedKey, failedKeys };
+              return response;
+            }
+
+            console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode}) - streaming`);
+            this.keyRotator.incrementKeyUsage(apiKey);
+            response._keyInfo = { keyUsed: maskedKey, failedKeys };
+            return response;
+          } else {
+            const response = await this.sendRequest(method, path, body, headers, apiKey, false, proxy);
+
+            const rotationReason = this.getRotationReason(response, rotationStatusCodes);
+            if (rotationReason) {
+              const isAuthError = rotationReason.reason === 'invalid_api_key';
+
+              if (hasProxies && !isAuthError && proxyAttempt < maxProxyAttempts - 1) {
+                console.log(`[GEMINI::${maskedKey}] Status ${response.statusCode} - assuming proxy issue, rotating proxy...`);
+                lastResponse = response;
+                continue;
+              }
+
+              console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
+              if (rotationReason.reason === 'rate_limited') {
+                requestContext.markKeyAsRateLimited(apiKey);
+              } else {
+                requestContext.markKeyAsFailed(apiKey);
+              }
+              failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
+              lastResponse = response;
+              break; // Break the proxy loop to move to the next key
+            }
+
+            console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode})`);
+            this.keyRotator.incrementKeyUsage(apiKey);
             response._keyInfo = { keyUsed: maskedKey, failedKeys };
             return response;
           }
+        } catch (error) {
+          console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
 
-          console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode}) - streaming`);
-          this.keyRotator.incrementKeyUsage(apiKey);
-          response._keyInfo = { keyUsed: maskedKey, failedKeys };
-          return response;
-        } else {
-          const response = await this.sendRequest(method, path, body, headers, apiKey, false);
-
-          const rotationReason = this.getRotationReason(response, rotationStatusCodes);
-          if (rotationReason) {
-            console.log(`[GEMINI::${maskedKey}] ${rotationReason.logMessage} - trying next key`);
-            if (rotationReason.reason === 'rate_limited') {
-              requestContext.markKeyAsRateLimited(apiKey);
-            } else {
-              requestContext.markKeyAsFailed(apiKey);
-            }
-            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: rotationReason.reason });
-            lastResponse = response;
+          if (hasProxies && proxyAttempt < maxProxyAttempts - 1) {
+            console.log(`[GEMINI::${maskedKey}] Request error - assuming proxy issue, rotating proxy...`);
+            lastError = error;
             continue;
           }
 
-          console.log(`[GEMINI::${maskedKey}] Success (${response.statusCode})`);
-          this.keyRotator.incrementKeyUsage(apiKey);
-          response._keyInfo = { keyUsed: maskedKey, failedKeys };
-          return response;
+          failedKeys.push({ key: maskedKey, status: null, reason: error.message });
+          lastError = error;
+          break; // Break the proxy loop to move to the next key
         }
-      } catch (error) {
-        console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
-        failedKeys.push({ key: maskedKey, status: null, reason: error.message });
-        lastError = error;
-        continue;
       }
     }
 
@@ -222,65 +255,99 @@ class GeminiClient {
     return options;
   }
 
-  sendRequest(method, path, body, headers, apiKey, useHeader = false) {
+  sendRequest(method, path, body, headers, apiKey, useHeader = false, proxy = null) {
     return new Promise((resolve, reject) => {
       const options = this._buildRequestOptions(method, path, body, headers, apiKey, useHeader);
 
-      const req = https.request(options, (res) => {
-        let data = '';
+      const makeHttpCall = () => {
+        const req = https.request(options, (res) => {
+          let data = '';
 
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
 
-        res.on('end', () => {
-          resolve({
-            statusCode: res.statusCode,
-            headers: res.headers,
-            data: data
+          res.on('end', () => {
+            resolve({
+              statusCode: res.statusCode,
+              headers: res.headers,
+              data: data
+            });
           });
         });
-      });
 
-      req.on('error', (error) => {
-        const maskedKey = this.maskApiKey(apiKey);
-        console.log(`[GEMINI::${maskedKey}] HTTP request error: ${error.message}`);
-        reject(error);
-      });
+        req.on('error', (error) => {
+          const maskedKey = this.maskApiKey(apiKey);
+          console.log(`[GEMINI::${maskedKey}] HTTP request error: ${error.message}`);
+          reject(error);
+        });
 
-      if (body && method !== 'GET') {
-        const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
-        req.write(bodyData);
+        if (body && method !== 'GET') {
+          const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
+          req.write(bodyData);
+        }
+
+        req.end();
+      };
+
+      if (proxy && this.proxyRotator) {
+        this.proxyRotator.createConnection(proxy, options.hostname, options.port || 443)
+          .then((secureSocket) => {
+            options.createConnection = () => secureSocket;
+            makeHttpCall();
+          })
+          .catch((err) => {
+            const maskedKey = this.maskApiKey(apiKey);
+            console.log(`[GEMINI::${maskedKey}] Proxy connection error: ${err.message}`);
+            reject(err);
+          });
+      } else {
+        makeHttpCall();
       }
-
-      req.end();
     });
   }
 
-  sendStreamingRequest(method, path, body, headers, apiKey, useHeader = false) {
+  sendStreamingRequest(method, path, body, headers, apiKey, useHeader = false, proxy = null) {
     return new Promise((resolve, reject) => {
       const options = this._buildRequestOptions(method, path, body, headers, apiKey, useHeader);
 
-      const req = https.request(options, (res) => {
-        resolve({
-          statusCode: res.statusCode,
-          headers: res.headers,
-          stream: res
+      const makeHttpCall = () => {
+        const req = https.request(options, (res) => {
+          resolve({
+            statusCode: res.statusCode,
+            headers: res.headers,
+            stream: res
+          });
         });
-      });
 
-      req.on('error', (error) => {
-        const maskedKey = this.maskApiKey(apiKey);
-        console.log(`[GEMINI::${maskedKey}] HTTP streaming request error: ${error.message}`);
-        reject(error);
-      });
+        req.on('error', (error) => {
+          const maskedKey = this.maskApiKey(apiKey);
+          console.log(`[GEMINI::${maskedKey}] HTTP streaming request error: ${error.message}`);
+          reject(error);
+        });
 
-      if (body && method !== 'GET') {
-        const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
-        req.write(bodyData);
+        if (body && method !== 'GET') {
+          const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
+          req.write(bodyData);
+        }
+
+        req.end();
+      };
+
+      if (proxy && this.proxyRotator) {
+        this.proxyRotator.createConnection(proxy, options.hostname, options.port || 443)
+          .then((secureSocket) => {
+            options.createConnection = () => secureSocket;
+            makeHttpCall();
+          })
+          .catch((err) => {
+            const maskedKey = this.maskApiKey(apiKey);
+            console.log(`[GEMINI::${maskedKey}] Proxy streaming connection error: ${err.message}`);
+            reject(err);
+          });
+      } else {
+        makeHttpCall();
       }
-
-      req.end();
     });
   }
 

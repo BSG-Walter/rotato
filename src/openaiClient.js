@@ -2,9 +2,10 @@ const https = require('https');
 const { URL } = require('url');
 
 class OpenAIClient {
-  constructor(keyRotator, baseUrl = 'https://api.openai.com') {
+  constructor(keyRotator, baseUrl = 'https://api.openai.com', proxyRotator = null) {
     this.keyRotator = keyRotator;
     this.baseUrl = baseUrl;
+    this.proxyRotator = proxyRotator;
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null, streaming = false) {
@@ -15,53 +16,82 @@ class OpenAIClient {
     const failedKeys = []; // Track which keys failed and why
 
     // Determine which status codes should trigger rotation
-    const rotationStatusCodes = customStatusCodes || new Set([429]);
+    const rotationStatusCodes = customStatusCodes || new Set([429, 404]);
 
     // Try each available key for this request
     let apiKey;
     while ((apiKey = requestContext.getNextKey()) !== null) {
       const maskedKey = this.maskApiKey(apiKey);
 
-      console.log(`[OPENAI::${maskedKey}] Attempting ${method} ${path}${streaming ? ' (streaming)' : ''}`);
+      // Determine how many proxy attempts we will make for this key
+      const hasProxies = this.proxyRotator && this.proxyRotator.hasProxies();
+      const maxProxyAttempts = hasProxies ? 2 : 1;
 
-      try {
-        if (streaming) {
-          const response = await this.sendStreamingRequest(method, path, body, headers, apiKey);
+      for (let proxyAttempt = 0; proxyAttempt < maxProxyAttempts; proxyAttempt++) {
+        const proxy = hasProxies ? await this.proxyRotator.getNextProxy() : null;
+        const proxyLog = proxy ? ` via proxy ${proxy.proxy_address}:${proxy.port} (attempt ${proxyAttempt + 1}/2)` : '';
 
-          if (rotationStatusCodes.has(response.statusCode)) {
-            console.log(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key`);
-            response.stream.resume();
-            requestContext.markKeyAsRateLimited(apiKey);
-            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: 'rate_limited' });
-            lastResponse = { statusCode: response.statusCode, headers: response.headers, data: '' };
+        console.log(`[OPENAI::${maskedKey}] Attempting ${method} ${path}${streaming ? ' (streaming)' : ''}${proxyLog}`);
+
+        try {
+          if (streaming) {
+            const response = await this.sendStreamingRequest(method, path, body, headers, apiKey, proxy);
+
+            if (rotationStatusCodes.has(response.statusCode)) {
+              if (hasProxies && proxyAttempt < maxProxyAttempts - 1) {
+                console.log(`[OPENAI::${maskedKey}] Status ${response.statusCode} - assuming proxy issue, rotating proxy...`);
+                response.stream.resume();
+                lastResponse = { statusCode: response.statusCode, headers: response.headers, data: '' };
+                continue;
+              }
+
+              console.log(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key`);
+              response.stream.resume();
+              requestContext.markKeyAsRateLimited(apiKey);
+              failedKeys.push({ key: maskedKey, status: response.statusCode, reason: 'rate_limited' });
+              lastResponse = { statusCode: response.statusCode, headers: response.headers, data: '' };
+              break; // Break proxy loop to move to next key
+            }
+
+            console.log(`[OPENAI::${maskedKey}] Success (${response.statusCode}) - streaming`);
+            this.keyRotator.incrementKeyUsage(apiKey);
+            response._keyInfo = { keyUsed: maskedKey, failedKeys };
+            return response;
+          } else {
+            const response = await this.sendRequest(method, path, body, headers, apiKey, proxy);
+
+            if (rotationStatusCodes.has(response.statusCode)) {
+              if (hasProxies && proxyAttempt < maxProxyAttempts - 1) {
+                console.log(`[OPENAI::${maskedKey}] Status ${response.statusCode} - assuming proxy issue, rotating proxy...`);
+                lastResponse = response;
+                continue;
+              }
+
+              console.log(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key`);
+              requestContext.markKeyAsRateLimited(apiKey);
+              failedKeys.push({ key: maskedKey, status: response.statusCode, reason: 'rate_limited' });
+              lastResponse = response;
+              break; // Break proxy loop to move to next key
+            }
+
+            console.log(`[OPENAI::${maskedKey}] Success (${response.statusCode})`);
+            this.keyRotator.incrementKeyUsage(apiKey);
+            response._keyInfo = { keyUsed: maskedKey, failedKeys };
+            return response;
+          }
+        } catch (error) {
+          console.log(`[OPENAI::${maskedKey}] Request failed: ${error.message}`);
+
+          if (hasProxies && proxyAttempt < maxProxyAttempts - 1) {
+            console.log(`[OPENAI::${maskedKey}] Request error - assuming proxy issue, rotating proxy...`);
+            lastError = error;
             continue;
           }
 
-          console.log(`[OPENAI::${maskedKey}] Success (${response.statusCode}) - streaming`);
-          this.keyRotator.incrementKeyUsage(apiKey);
-          response._keyInfo = { keyUsed: maskedKey, failedKeys };
-          return response;
-        } else {
-          const response = await this.sendRequest(method, path, body, headers, apiKey);
-
-          if (rotationStatusCodes.has(response.statusCode)) {
-            console.log(`[OPENAI::${maskedKey}] Status ${response.statusCode} triggers rotation - trying next key`);
-            requestContext.markKeyAsRateLimited(apiKey);
-            failedKeys.push({ key: maskedKey, status: response.statusCode, reason: 'rate_limited' });
-            lastResponse = response;
-            continue;
-          }
-
-          console.log(`[OPENAI::${maskedKey}] Success (${response.statusCode})`);
-          this.keyRotator.incrementKeyUsage(apiKey);
-          response._keyInfo = { keyUsed: maskedKey, failedKeys };
-          return response;
+          failedKeys.push({ key: maskedKey, status: null, reason: error.message });
+          lastError = error;
+          break; // Break proxy loop to move to next key
         }
-      } catch (error) {
-        console.log(`[OPENAI::${maskedKey}] Request failed: ${error.message}`);
-        failedKeys.push({ key: maskedKey, status: null, reason: error.message });
-        lastError = error;
-        continue;
       }
     }
 
@@ -133,66 +163,100 @@ class OpenAIClient {
     return options;
   }
 
-  sendRequest(method, path, body, headers, apiKey) {
+  sendRequest(method, path, body, headers, apiKey, proxy = null) {
     return new Promise((resolve, reject) => {
       const options = this._buildRequestOptions(method, path, body, headers, apiKey);
 
-      const req = https.request(options, (res) => {
-        let data = '';
+      const makeHttpCall = () => {
+        const req = https.request(options, (res) => {
+          let data = '';
 
-        res.on('data', (chunk) => {
-          data += chunk;
-        });
+          res.on('data', (chunk) => {
+            data += chunk;
+          });
 
-        res.on('end', () => {
-          resolve({
-            statusCode: res.statusCode,
-            headers: res.headers,
-            data: data
+          res.on('end', () => {
+            resolve({
+              statusCode: res.statusCode,
+              headers: res.headers,
+              data: data
+            });
           });
         });
-      });
 
-      req.on('error', (error) => {
-        const maskedKey = this.maskApiKey(apiKey);
-        console.log(`[OPENAI::${maskedKey}] HTTP request error: ${error.message}`);
-        reject(error);
-      });
+        req.on('error', (error) => {
+          const maskedKey = this.maskApiKey(apiKey);
+          console.log(`[OPENAI::${maskedKey}] HTTP request error: ${error.message}`);
+          reject(error);
+        });
 
-      if (body && method !== 'GET') {
-        const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
-        req.write(bodyData);
+        if (body && method !== 'GET') {
+          const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
+          req.write(bodyData);
+        }
+
+        req.end();
+      };
+
+      if (proxy && this.proxyRotator) {
+        this.proxyRotator.createConnection(proxy, options.hostname, options.port || 443)
+          .then((secureSocket) => {
+            options.createConnection = () => secureSocket;
+            makeHttpCall();
+          })
+          .catch((err) => {
+            const maskedKey = this.maskApiKey(apiKey);
+            console.log(`[OPENAI::${maskedKey}] Proxy connection error: ${err.message}`);
+            reject(err);
+          });
+      } else {
+        makeHttpCall();
       }
-
-      req.end();
     });
   }
 
-  sendStreamingRequest(method, path, body, headers, apiKey) {
+  sendStreamingRequest(method, path, body, headers, apiKey, proxy = null) {
     return new Promise((resolve, reject) => {
       const options = this._buildRequestOptions(method, path, body, headers, apiKey);
 
-      const req = https.request(options, (res) => {
-        // Resolve immediately with the raw stream - don't buffer
-        resolve({
-          statusCode: res.statusCode,
-          headers: res.headers,
-          stream: res
+      const makeHttpCall = () => {
+        const req = https.request(options, (res) => {
+          // Resolve immediately with the raw stream - don't buffer
+          resolve({
+            statusCode: res.statusCode,
+            headers: res.headers,
+            stream: res
+          });
         });
-      });
 
-      req.on('error', (error) => {
-        const maskedKey = this.maskApiKey(apiKey);
-        console.log(`[OPENAI::${maskedKey}] HTTP streaming request error: ${error.message}`);
-        reject(error);
-      });
+        req.on('error', (error) => {
+          const maskedKey = this.maskApiKey(apiKey);
+          console.log(`[OPENAI::${maskedKey}] HTTP streaming request error: ${error.message}`);
+          reject(error);
+        });
 
-      if (body && method !== 'GET') {
-        const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
-        req.write(bodyData);
+        if (body && method !== 'GET') {
+          const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
+          req.write(bodyData);
+        }
+
+        req.end();
+      };
+
+      if (proxy && this.proxyRotator) {
+        this.proxyRotator.createConnection(proxy, options.hostname, options.port || 443)
+          .then((secureSocket) => {
+            options.createConnection = () => secureSocket;
+            makeHttpCall();
+          })
+          .catch((err) => {
+            const maskedKey = this.maskApiKey(apiKey);
+            console.log(`[OPENAI::${maskedKey}] Proxy streaming connection error: ${err.message}`);
+            reject(err);
+          });
+      } else {
+        makeHttpCall();
       }
-
-      req.end();
     });
   }
 
