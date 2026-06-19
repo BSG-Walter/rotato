@@ -9,6 +9,10 @@ class GeminiClient {
   }
 
   async makeRequest(method, path, body, headers = {}, customStatusCodes = null, streaming = false) {
+    const originalBody = body;
+    const requestBody = this.injectSafetySettings(method, path, body);
+    const fallbackBody = requestBody !== originalBody ? originalBody : null;
+
     // Check if an API key was provided in headers
     const providedApiKey = headers['x-goog-api-key'];
 
@@ -22,15 +26,25 @@ class GeminiClient {
 
       try {
         if (streaming) {
-          const response = await this.sendStreamingRequest(method, path, body, cleanHeaders, providedApiKey, true);
+          const response = await this.sendStreamingRequest(method, path, requestBody, cleanHeaders, providedApiKey, true, null);
+          if (response.statusCode >= 400) {
+            response.data = await this.drainStreamingResponse(response.stream);
+          }
+          if (response.statusCode === 400 && fallbackBody) {
+            const preview = response.data ? response.data.substring(0, 500) : 'empty response';
+            console.log(`[GEMINI::${maskedKey}] 400 with safetySettings injection; retrying without safetySettings. Response: ${preview}`);
+            const retryResponse = await this.sendStreamingRequest(method, path, fallbackBody, cleanHeaders, providedApiKey, true);
+            if (retryResponse.statusCode >= 400) {
+              retryResponse.data = await this.drainStreamingResponse(retryResponse.stream);
+            }
+            return this.withKeyInfo(retryResponse, maskedKey, []);
+          }
           console.log(`[GEMINI::${maskedKey}] Response (${response.statusCode}) - streaming`);
-          response._keyInfo = { keyUsed: maskedKey, failedKeys: [] };
-          return response;
+          return this.withKeyInfo(response, maskedKey, []);
         } else {
-          const response = await this.sendRequest(method, path, body, cleanHeaders, providedApiKey, true);
+          const response = await this.sendRequest(method, path, requestBody, cleanHeaders, providedApiKey, true, null, fallbackBody);
           console.log(`[GEMINI::${maskedKey}] Response (${response.statusCode})`);
-          response._keyInfo = { keyUsed: maskedKey, failedKeys: [] };
-          return response;
+          return this.withKeyInfo(response, maskedKey, []);
         }
       } catch (error) {
         console.log(`[GEMINI::${maskedKey}] Request failed: ${error.message}`);
@@ -44,7 +58,7 @@ class GeminiClient {
     let lastResponse = null;
     const failedKeys = [];
 
-    const rotationStatusCodes = customStatusCodes || new Set([429, 404]);
+    const rotationStatusCodes = customStatusCodes || new Set([400, 429, 404]);
 
     let apiKey;
     while ((apiKey = requestContext.getNextKey()) !== null) {
@@ -62,11 +76,21 @@ class GeminiClient {
 
         try {
           if (streaming) {
-            const response = await this.sendStreamingRequest(method, path, body, headers, apiKey, false, proxy);
+            let response = await this.sendStreamingRequest(method, path, requestBody, headers, apiKey, false, proxy);
 
             // If the streaming request returned an error status code, drain the stream to get the error payload
             if (response.statusCode >= 400) {
               response.data = await this.drainStreamingResponse(response.stream);
+            }
+
+            if (response.statusCode === 400 && fallbackBody) {
+              const preview = response.data ? response.data.substring(0, 500) : 'empty response';
+              console.log(`[GEMINI::${maskedKey}] 400 with safetySettings injection; retrying without safetySettings. Response: ${preview}`);
+              const retryResponse = await this.sendStreamingRequest(method, path, fallbackBody, headers, apiKey, false, proxy);
+              if (retryResponse.statusCode >= 400) {
+                retryResponse.data = await this.drainStreamingResponse(retryResponse.stream);
+              }
+              response = retryResponse;
             }
 
             const rotationReason = this.getRotationReason(response, rotationStatusCodes);
@@ -103,7 +127,7 @@ class GeminiClient {
             response._keyInfo = { keyUsed: maskedKey, failedKeys };
             return response;
           } else {
-            const response = await this.sendRequest(method, path, body, headers, apiKey, false, proxy);
+            const response = await this.sendRequest(method, path, requestBody, headers, apiKey, false, proxy, fallbackBody);
 
             const rotationReason = this.getRotationReason(response, rotationStatusCodes);
             if (rotationReason) {
@@ -194,6 +218,56 @@ class GeminiClient {
     throw new Error('All API keys exhausted without clear error');
   }
 
+  injectSafetySettings(method, path, body) {
+    if (!body || method === 'GET') return body;
+    if (this.isOpenAICompatibleEndpoint(path)) return body; // Google rejects safetySettings on the OpenAI-compatible endpoint!
+
+    try {
+      const parsedBody = typeof body === 'string' ? JSON.parse(body) : body;
+      if (!parsedBody || typeof parsedBody !== 'object' || Array.isArray(parsedBody)) return body;
+
+      parsedBody.safetySettings = this.getSafetySettings();
+      delete parsedBody.safety_settings;
+
+      return JSON.stringify(parsedBody);
+    } catch (e) {
+      console.log(`[GEMINI] Failed to inject safetySettings: ${e.message}`);
+      return body;
+    }
+  }
+
+  getSafetySettings() {
+    return [
+      {
+        category: "HARM_CATEGORY_HARASSMENT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_HATE_SPEECH",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+        threshold: "BLOCK_NONE"
+      },
+      {
+        category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+        threshold: "BLOCK_NONE"
+      }
+    ];
+  }
+
+  withKeyInfo(response, keyUsed, failedKeys) {
+    response._keyInfo = { keyUsed, failedKeys };
+    return response;
+  }
+
+  logResponsePreview(maskedKey, response) {
+    if (!response || response.statusCode !== 400 || !response.data) return;
+    const preview = response.data.substring(0, 500);
+    console.log(`[GEMINI::${maskedKey}] 400 response preview: ${preview}`);
+  }
+
   _buildRequestOptions(method, path, body, headers, apiKey, useHeader) {
     let fullUrl;
     if (!path || path === '/') {
@@ -255,55 +329,85 @@ class GeminiClient {
     return options;
   }
 
-  sendRequest(method, path, body, headers, apiKey, useHeader = false, proxy = null) {
+  sendRequest(method, path, body, headers, apiKey, useHeader = false, proxy = null, fallbackBody = null) {
     return new Promise((resolve, reject) => {
-      const options = this._buildRequestOptions(method, path, body, headers, apiKey, useHeader);
+      const maskedKey = this.maskApiKey(apiKey);
 
-      const makeHttpCall = () => {
-        const req = https.request(options, (res) => {
-          let data = '';
+      const doRequest = (requestBody) => {
+        const options = this._buildRequestOptions(method, path, requestBody, headers, apiKey, useHeader);
 
-          res.on('data', (chunk) => {
-            data += chunk;
-          });
+        const makeHttpCall = (secureSocket = null) => {
+          if (secureSocket) {
+            options.createConnection = () => secureSocket;
+          }
 
-          res.on('end', () => {
-            resolve({
-              statusCode: res.statusCode,
-              headers: res.headers,
-              data: data
+          const bodyData = requestBody && method !== 'GET'
+            ? (typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody))
+            : null;
+
+          if (bodyData) {
+            options.headers['Content-Length'] = Buffer.byteLength(bodyData);
+          } else {
+            delete options.headers['Content-Length'];
+          }
+
+          const req = https.request(options, (res) => {
+            let data = '';
+
+            res.on('data', (chunk) => {
+              data += chunk;
+            });
+
+            res.on('end', () => {
+              if (fallbackBody && requestBody !== fallbackBody && res.statusCode === 400) {
+                console.log(`[GEMINI::${maskedKey}] 400 with safetySettings injection; retrying without safetySettings. Response: ${data.substring(0, 500)}`);
+                if (secureSocket) {
+                  try { secureSocket.destroy(); } catch (e) {}
+                }
+                doRequest(fallbackBody);
+                return;
+              }
+
+              this.logResponsePreview(maskedKey, {
+                statusCode: res.statusCode,
+                data: data
+              });
+
+              resolve({
+                statusCode: res.statusCode,
+                headers: res.headers,
+                data: data
+              });
             });
           });
-        });
 
-        req.on('error', (error) => {
-          const maskedKey = this.maskApiKey(apiKey);
-          console.log(`[GEMINI::${maskedKey}] HTTP request error: ${error.message}`);
-          reject(error);
-        });
+          req.on('error', (error) => {
+            console.log(`[GEMINI::${maskedKey}] HTTP request error: ${error.message}`);
+            reject(error);
+          });
 
-        if (body && method !== 'GET') {
-          const bodyData = typeof body === 'string' ? body : JSON.stringify(body);
-          req.write(bodyData);
+          if (bodyData) {
+            req.write(bodyData);
+          }
+
+          req.end();
+        };
+
+        if (proxy && this.proxyRotator) {
+          this.proxyRotator.createConnection(proxy, options.hostname, options.port || 443)
+            .then((secureSocket) => {
+              makeHttpCall(secureSocket);
+            })
+            .catch((err) => {
+              console.log(`[GEMINI::${maskedKey}] Proxy connection error: ${err.message}`);
+              reject(err);
+            });
+        } else {
+          makeHttpCall();
         }
-
-        req.end();
       };
 
-      if (proxy && this.proxyRotator) {
-        this.proxyRotator.createConnection(proxy, options.hostname, options.port || 443)
-          .then((secureSocket) => {
-            options.createConnection = () => secureSocket;
-            makeHttpCall();
-          })
-          .catch((err) => {
-            const maskedKey = this.maskApiKey(apiKey);
-            console.log(`[GEMINI::${maskedKey}] Proxy connection error: ${err.message}`);
-            reject(err);
-          });
-      } else {
-        makeHttpCall();
-      }
+      doRequest(body);
     });
   }
 
@@ -369,18 +473,18 @@ class GeminiClient {
   }
 
   getRotationReason(response, rotationStatusCodes) {
-    if (rotationStatusCodes.has(response.statusCode)) {
-      return {
-        reason: response.statusCode === 429 ? 'rate_limited' : `status_${response.statusCode}`,
-        logMessage: `Status ${response.statusCode} triggers rotation`
-      };
-    }
-
     const authError = this.getGeminiAuthError(response);
     if (authError) {
       return {
         reason: 'invalid_api_key',
         logMessage: `Gemini auth error (${authError}) triggers rotation`
+      };
+    }
+
+    if (rotationStatusCodes.has(response.statusCode)) {
+      return {
+        reason: response.statusCode === 429 ? 'rate_limited' : `status_${response.statusCode}`,
+        logMessage: `Status ${response.statusCode} triggers rotation`
       };
     }
 

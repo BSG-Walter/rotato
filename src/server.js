@@ -247,7 +247,7 @@ class ProxyServer {
       }
 
       // Detect streaming request
-      const isStreaming = this.isStreamingRequest(body);
+      const isStreaming = this.isStreamingRequest(body) || req.url.includes('streamGenerateContent');
       if (isStreaming) {
         console.log(`[REQ-${requestId}] Streaming request detected`);
       }
