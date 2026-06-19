@@ -58,7 +58,7 @@ class GeminiClient {
     let lastResponse = null;
     const failedKeys = [];
 
-    const rotationStatusCodes = customStatusCodes || new Set([400, 429, 404]);
+    const rotationStatusCodes = customStatusCodes || new Set([400, 429, 404, 500, 502, 503, 504]);
 
     let apiKey;
     while ((apiKey = requestContext.getNextKey()) !== null) {
@@ -310,7 +310,7 @@ class GeminiClient {
     } else if (useHeader) {
       finalHeaders['x-goog-api-key'] = apiKey;
     } else {
-      url.searchParams.append('key', apiKey);
+      url.searchParams.set('key', apiKey);
     }
 
     const options = {
